@@ -1,13 +1,14 @@
 """
-GEX Analytics Engine — Computes Gamma Exposure, Call/Put Walls, Gamma Flip from a MarketState snapshot.
+GEX + VEX Analytics Engine — Computes Gamma and Vega Exposure from a MarketState snapshot.
 
 This module is designed to be called from a ProcessPoolExecutor (CPU-bound, GIL-free).
 It accepts a plain dict snapshot (serializable) and returns a plain dict result.
 
 Architecture note:
 - Deribit's `get_book_summary_by_currency` does NOT return Greeks.
-- We compute Gamma locally via vectorized Black-Scholes (black_scholes.py).
-- Formula: GEX = Gamma * OI * Spot^2 * 0.01 * sign  (1 contract = 1 BTC on Deribit).
+- We compute Gamma and Vega locally via vectorized Black-Scholes (black_scholes.py).
+- GEX Formula: Gamma * OI * Spot^2 * 0.01 * sign  (1 contract = 1 BTC on Deribit).
+- VEX Formula: Vega * OI * sign  (Vega already in USD per 1% IV move).
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from .black_scholes import vectorized_gamma, vectorized_gamma_profile
+from .black_scholes import vectorized_gamma, vectorized_vega, vectorized_gamma_profile
 
 
 def calculate_gex_from_snapshot(snapshot: dict) -> dict:
@@ -104,12 +105,36 @@ def calculate_gex_from_snapshot(snapshot: dict) -> dict:
     df["gamma"] = gammas
     df["gex"] = gex_values
 
+    # ── 3b. VEX Calculation (Vega Exposure) ──────────────────────────────
+    # Vega already returned in USD per 1% IV change (per_1pct=True)
+    # VEX = Vega * OI * sign(contract_type)
+    # No hedge ratio applied — same dealer positioning assumption as GEX (1.0)
+    vegas = vectorized_vega(
+        spot=spot,
+        strikes=strikes,
+        T=T,
+        vol=vol,
+        r=r,
+        q=0.0,
+        per_1pct=True,
+    )
+
+    vex_values = vegas * oi * contract_types
+
+    df["vega"] = vegas
+    df["vex"] = vex_values
+
     # ── 4. Aggregate by Strike ───────────────────────────────────────────
     gex_by_strike = df.groupby("strike")["gex"].sum()
     call_mask = df["type"] == "C"
     put_mask = df["type"] == "P"
     call_gex_by_strike = df[call_mask].groupby("strike")["gex"].sum()
     put_gex_by_strike = df[put_mask].groupby("strike")["gex"].sum()
+
+    # VEX aggregation by strike
+    vex_by_strike = df.groupby("strike")["vex"].sum()
+    call_vex_by_strike = df[call_mask].groupby("strike")["vex"].sum()
+    put_vex_by_strike = df[put_mask].groupby("strike")["vex"].sum()
 
     # ── 5. Identify Walls ────────────────────────────────────────────────
     total_gex = float(gex_by_strike.sum())
@@ -121,6 +146,11 @@ def calculate_gex_from_snapshot(snapshot: dict) -> dict:
     # Put Wall: strike with lowest (most negative) GEX
     put_wall_strike = float(gex_by_strike.idxmin()) if not gex_by_strike.empty else 0.0
     put_wall_gex = float(gex_by_strike.min()) if not gex_by_strike.empty else 0.0
+
+    # ── 5b. VEX Totals ───────────────────────────────────────────────────
+    total_vex = float(vex_by_strike.sum())
+    call_vex_total = float(df[call_mask]["vex"].sum())
+    put_vex_total = float(df[put_mask]["vex"].sum())
 
     # ── 6. Gamma Profile & Flip ──────────────────────────────────────────
     levels, profile_values = vectorized_gamma_profile(
@@ -138,19 +168,32 @@ def calculate_gex_from_snapshot(snapshot: dict) -> dict:
     gamma_flip = _find_gamma_flip(levels, profile_values)
 
     # ── 7. Regime Detection ──────────────────────────────────────────────
-    regime = "Positive" if total_gex > 0 else "Negative"
+    gex_regime = "Positive" if total_gex > 0 else "Negative"
+    vex_regime = _classify_vex_regime(total_vex, spot)
+    vex_gex_ratio = abs(total_vex) / abs(total_gex) if abs(total_gex) > 1e-6 else 0.0
 
     # ── 8. Build payload ─────────────────────────────────────────────────
     payload = {
         "asset": "BTC/USD",
         "spot_price": round(spot, 2),
+
+        # GEX metrics
         "total_gex_usd": round(total_gex, 2),
-        "gex_regime": regime,
+        "gex_regime": gex_regime,
         "call_wall_strike": round(call_wall_strike, 0),
         "call_wall_gex_usd": round(call_wall_gex, 2),
         "put_wall_strike": round(put_wall_strike, 0),
         "put_wall_gex_usd": round(put_wall_gex, 2),
         "gamma_flip": round(gamma_flip, 2) if gamma_flip else None,
+
+        # VEX metrics
+        "total_vex_usd": round(total_vex, 2),
+        "call_vex_usd": round(call_vex_total, 2),
+        "put_vex_usd": round(put_vex_total, 2),
+        "vex_regime": vex_regime,
+        "vex_gex_ratio": round(vex_gex_ratio, 3),
+
+        # Metadata
         "instruments_analyzed": len(df),
         "gamma_profile": {
             "levels": levels.tolist(),
@@ -164,6 +207,15 @@ def calculate_gex_from_snapshot(snapshot: dict) -> dict:
         },
         "put_gex_by_strike": {
             str(int(k)): round(v, 2) for k, v in put_gex_by_strike.items()
+        },
+        "vex_by_strike": {
+            str(int(k)): round(v, 2) for k, v in vex_by_strike.items()
+        },
+        "call_vex_by_strike": {
+            str(int(k)): round(v, 2) for k, v in call_vex_by_strike.items()
+        },
+        "put_vex_by_strike": {
+            str(int(k)): round(v, 2) for k, v in put_vex_by_strike.items()
         },
     }
 
@@ -215,3 +267,29 @@ def _find_gamma_flip(levels: np.ndarray, total_gamma: np.ndarray) -> float | Non
 
     gamma_flip = x1 - y1 * (x2 - x1) / (y2 - y1)
     return float(gamma_flip)
+
+
+def _classify_vex_regime(total_vex_usd: float, spot_price: float) -> str:
+    """
+    Classify VEX regime using spot-normalized thresholds.
+
+    Normalization ensures the regime classification scales with market size.
+    When BTC doubles, the same absolute VEX becomes proportionally smaller.
+
+    Thresholds are expressed as |VEX| / spot_price:
+    - Low:      < 70   (minimal vol pressure)
+    - Moderate: < 200  (normal vol exposure)
+    - Elevated: < 400  (significant vol buildup)
+    - Extreme:  >= 400 (squeeze risk zone)
+    """
+    if spot_price <= 0:
+        return "Unknown"
+    vex_per_btc = abs(total_vex_usd) / spot_price
+    if vex_per_btc < 70:
+        return "Low"
+    elif vex_per_btc < 200:
+        return "Moderate"
+    elif vex_per_btc < 400:
+        return "Elevated"
+    else:
+        return "Extreme"

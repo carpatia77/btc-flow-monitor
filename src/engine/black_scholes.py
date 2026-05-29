@@ -57,6 +57,60 @@ def vectorized_gamma(
     return gamma
 
 
+def vectorized_vega(
+    spot: float,
+    strikes: np.ndarray,
+    T: np.ndarray,
+    vol: np.ndarray,
+    r: float = 0.05,
+    q: float = 0.0,
+    per_1pct: bool = True,
+) -> np.ndarray:
+    """
+    Calculates Black-Scholes Vega for N contracts simultaneously.
+
+    Vega measures sensitivity of option price to a change in implied volatility.
+    Formula: Vega = S * sqrt(T) * N'(d1)
+
+    Uses the same d1 calculation as vectorized_gamma (via forward price) to ensure
+    mathematical consistency across the engine.
+
+    Parameters
+    ----------
+    spot : float
+        Current underlying price (BTC/USD).
+    strikes : np.ndarray
+        Array of strike prices.
+    T : np.ndarray
+        Time to expiration in years for each contract.
+    vol : np.ndarray
+        Implied volatility (decimal) for each contract.
+    r : float
+        Risk-free interest rate (decimal).
+    q : float
+        Continuous dividend yield (0 for BTC).
+    per_1pct : bool
+        If True, return Vega per 1% change in IV (trading desk convention).
+        If False, return raw Vega per 1.0 change in IV (academic convention).
+
+    Returns
+    -------
+    np.ndarray
+        Vega values in USD per contract.
+    """
+    # Same guards as vectorized_gamma — prevent division by zero
+    T = np.maximum(T, 1e-6)
+    vol = np.maximum(vol, 1e-6)
+
+    # Same forward price adjustment as vectorized_gamma
+    forward = spot * np.exp((r - q) * T)
+
+    d1 = (np.log(forward / strikes) + 0.5 * vol**2 * T) / (vol * np.sqrt(T))
+    vega = spot * np.sqrt(T) * norm.pdf(d1)
+
+    return vega * 0.01 if per_1pct else vega
+
+
 def vectorized_gamma_profile(
     spot: float,
     strikes: np.ndarray,
