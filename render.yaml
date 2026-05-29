@@ -1,0 +1,48 @@
+# Render Blueprint (Infrastructure as Code)
+# Documentação: https://render.com/docs/blueprint-reference
+
+services:
+  # 1. Nosso Worker (Cron Job que roda a cada 5 minutos)
+  - type: cron
+    name: btc-flow-worker
+    env: python
+    region: ohio
+    schedule: "*/5 * * * *"
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python btc_gex_worker.py"
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: DB_HOST
+        fromService:
+          type: pserv
+          name: btc-timescaledb
+          property: host
+      - key: DB_PORT
+        value: "5432"
+      - key: DB_NAME
+        value: "btc_options"
+      - key: DB_USER
+        value: "deribit_user"
+      - key: DB_PASSWORD
+        generateValue: true
+
+  # 2. Banco de Dados TimescaleDB (Como Serviço Privado Docker)
+  # O PostgreSQL gerenciado do Render NÃO possui a extensão TimescaleDB nativa.
+  # Portanto, subimos a imagem oficial do Timescale como um serviço privado.
+  - type: pserv
+    name: btc-timescaledb
+    env: docker
+    region: ohio
+    image: timescale/timescaledb-ha:pg16
+    disk:
+      name: timescaledb-data
+      mountPath: /home/postgres/pgdata/data
+      sizeGB: 10
+    envVars:
+      - key: POSTGRES_DB
+        value: "btc_options"
+      - key: POSTGRES_USER
+        value: "deribit_user"
+      - key: POSTGRES_PASSWORD
+        generateValue: true
