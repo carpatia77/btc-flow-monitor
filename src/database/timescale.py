@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+DATABASE_URL = os.getenv("DATABASE_URL")
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")
 DB_USER = os.getenv("DB_USER", "deribit_user")
@@ -21,25 +22,33 @@ DB_NAME = os.getenv("DB_NAME", "btc_options")
 
 async def get_db_pool() -> asyncpg.Pool:
     """Create and return an asyncpg connection pool."""
-    pool = await asyncpg.create_pool(
-        host=DB_HOST,
-        port=DB_PORT,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        database=DB_NAME,
-        min_size=1,
-        max_size=10
-    )
+    if DATABASE_URL:
+        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    else:
+        pool = await asyncpg.create_pool(
+            host=DB_HOST,
+            port=DB_PORT,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database=DB_NAME,
+            min_size=1,
+            max_size=10
+        )
     if not pool:
         raise RuntimeError("Failed to create database pool")
     return pool
 
 
 async def init_db(pool: asyncpg.Pool) -> None:
-    """Create tables and configure TimescaleDB hypertables."""
+    """Create tables and configure TimescaleDB hypertables if available."""
     async with pool.acquire() as conn:
-        # Ensure TimescaleDB extension exists
-        await conn.execute("CREATE EXTENSION IF NOT EXISTS timescaledb;")
+        has_timescale = True
+        try:
+            # Try to create TimescaleDB extension
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS timescaledb;")
+        except Exception as e:
+            logger.warning(f"TimescaleDB extension not supported on this PostgreSQL instance. Running in Vanilla mode. ({e})")
+            has_timescale = False
 
         # Options History Table
         await conn.execute("""
@@ -57,25 +66,27 @@ async def init_db(pool: asyncpg.Pool) -> None:
             );
         """)
         
-        # Check if hypertable already exists
-        hyper_check = await conn.fetchval("""
-            SELECT count(*) 
-            FROM _timescaledb_catalog.hypertable 
-            WHERE table_name = 'options_history';
-        """)
-        if hyper_check == 0:
-            logger.info("Converting options_history to hypertable...")
-            await conn.execute("SELECT create_hypertable('options_history', 'time');")
-            # Index for fast OI lookup by instrument
-            await conn.execute("CREATE INDEX ix_options_history_instrument_time ON options_history (instrument_name, time DESC);")
-            
-            # Compression and Retention Policies
-            try:
-                await conn.execute("ALTER TABLE options_history SET (timescaledb.compress, timescaledb.compress_segmentby = 'instrument_name');")
-                await conn.execute("SELECT add_compression_policy('options_history', compress_after => INTERVAL '7 days');")
-                await conn.execute("SELECT add_retention_policy('options_history', drop_after => INTERVAL '90 days');")
-            except Exception as e:
-                logger.warning(f"Could not apply compression/retention to options_history (requires TimescaleDB advanced features): {e}")
+        # We always want this index for fast OI lookups, even in Vanilla Postgres
+        await conn.execute("CREATE INDEX IF NOT EXISTS ix_options_history_instrument_time ON options_history (instrument_name, time DESC);")
+        
+        if has_timescale:
+            # Check if hypertable already exists
+            hyper_check = await conn.fetchval("""
+                SELECT count(*) 
+                FROM _timescaledb_catalog.hypertable 
+                WHERE table_name = 'options_history';
+            """)
+            if hyper_check == 0:
+                logger.info("Converting options_history to hypertable...")
+                await conn.execute("SELECT create_hypertable('options_history', 'time');")
+                
+                # Compression and Retention Policies
+                try:
+                    await conn.execute("ALTER TABLE options_history SET (timescaledb.compress, timescaledb.compress_segmentby = 'instrument_name');")
+                    await conn.execute("SELECT add_compression_policy('options_history', compress_after => INTERVAL '7 days');")
+                    await conn.execute("SELECT add_retention_policy('options_history', drop_after => INTERVAL '90 days');")
+                except Exception as e:
+                    logger.warning(f"Could not apply compression/retention to options_history: {e}")
 
         # Analytics Snapshots Table
         await conn.execute("""
@@ -91,20 +102,21 @@ async def init_db(pool: asyncpg.Pool) -> None:
             );
         """)
         
-        hyper_check_analytics = await conn.fetchval("""
-            SELECT count(*) 
-            FROM _timescaledb_catalog.hypertable 
-            WHERE table_name = 'analytics_snapshots';
-        """)
-        if hyper_check_analytics == 0:
-            logger.info("Converting analytics_snapshots to hypertable...")
-            await conn.execute("SELECT create_hypertable('analytics_snapshots', 'time');")
-            try:
-                await conn.execute("SELECT add_retention_policy('analytics_snapshots', drop_after => INTERVAL '2 years');")
-            except Exception as e:
-                logger.warning(f"Could not apply retention to analytics_snapshots: {e}")
+        if has_timescale:
+            hyper_check_analytics = await conn.fetchval("""
+                SELECT count(*) 
+                FROM _timescaledb_catalog.hypertable 
+                WHERE table_name = 'analytics_snapshots';
+            """)
+            if hyper_check_analytics == 0:
+                logger.info("Converting analytics_snapshots to hypertable...")
+                await conn.execute("SELECT create_hypertable('analytics_snapshots', 'time');")
+                try:
+                    await conn.execute("SELECT add_retention_policy('analytics_snapshots', drop_after => INTERVAL '2 years');")
+                except Exception as e:
+                    logger.warning(f"Could not apply retention to analytics_snapshots: {e}")
 
-        logger.info("TimescaleDB initialized successfully.")
+        logger.info(f"Database initialized successfully (Timescale Mode: {has_timescale}).")
 
 
 async def save_options_chain(pool: asyncpg.Pool, instruments: list[Any], spot_price: float, timestamp: str) -> None:
