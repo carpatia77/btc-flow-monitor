@@ -85,9 +85,17 @@ This starts:
 python btc_gex_worker.py
 ```
 
-Single-shot: fetch → calculate → print JSON → exit. Perfect for:
+### Cron (VPS Linux com Alertas por E-mail)
 
-```cron
+Criamos um script que configura automaticamente a *crontab* na sua VPS para rodar a checagem de saúde da API todos os dias às 06:00 da manhã (Horário de Brasília) e notificar o e-mail cadastrado em caso de falha:
+
+```bash
+chmod +x scripts/setup_cron.sh
+./scripts/setup_cron.sh
+```
+
+Para o cálculo de GEX propriamente dito (a cada 5min), você pode agendar o worker headless:
+```bash
 */5 * * * * cd /path/to/btc-flow-monitor && python btc_gex_worker.py >> /var/log/btc_gex.jsonl 2>&1
 ```
 
