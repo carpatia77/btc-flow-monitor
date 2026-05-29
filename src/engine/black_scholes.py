@@ -111,6 +111,89 @@ def vectorized_vega(
     return vega * 0.01 if per_1pct else vega
 
 
+def vectorized_theta(
+    spot: float,
+    strikes: np.ndarray,
+    T: np.ndarray,
+    vol: np.ndarray,
+    contract_types: np.ndarray,
+    r: float = 0.05,
+    q: float = 0.0,
+    per_day: bool = True,
+    dealer_perspective: bool = True,
+) -> np.ndarray:
+    """
+    Calculates Black-Scholes Theta for N contracts simultaneously.
+
+    Theta measures the rate of decline in the value of an option due to the passage of time.
+
+    Parameters
+    ----------
+    spot : float
+        Current underlying price (BTC/USD).
+    strikes : np.ndarray
+        Array of strike prices.
+    T : np.ndarray
+        Time to expiration in years for each contract.
+    vol : np.ndarray
+        Implied volatility (decimal) for each contract.
+    contract_types : np.ndarray
+        +1 for calls, -1 for puts.
+    r : float
+        Risk-free interest rate (decimal).
+    q : float
+        Continuous dividend yield (0 for BTC).
+    per_day : bool
+        If True, returns theta per day instead of per year.
+    dealer_perspective : bool
+        If True, returns the theta from the short seller's perspective (positive for time decay).
+
+    Returns
+    -------
+    np.ndarray
+        Theta values in USD.
+    """
+    # Safeguard against T -> 0 singularity
+    T = np.maximum(T, 1e-5)
+    vol = np.maximum(vol, 1e-6)
+
+    # d1 and d2 calculations
+    forward = spot * np.exp((r - q) * T)
+    d1 = (np.log(forward / strikes) + 0.5 * vol**2 * T) / (vol * np.sqrt(T))
+    d2 = d1 - vol * np.sqrt(T)
+
+    # Common decay term
+    vol_decay = -(spot * vol * norm.pdf(d1) * np.exp(-q * T)) / (2 * np.sqrt(T))
+
+    theta = np.zeros_like(strikes, dtype=float)
+
+    # Masks for calls and puts
+    is_call = contract_types > 0
+    is_put = contract_types < 0
+
+    # Theta Call (Annualized)
+    if np.any(is_call):
+        theta[is_call] = vol_decay[is_call] \
+                         + q * spot * norm.cdf(d1[is_call]) * np.exp(-q * T[is_call]) \
+                         - r * strikes[is_call] * np.exp(-r * T[is_call]) * norm.cdf(d2[is_call])
+
+    # Theta Put (Annualized)
+    if np.any(is_put):
+        theta[is_put] = vol_decay[is_put] \
+                        - q * spot * norm.cdf(-d1[is_put]) * np.exp(-q * T[is_put]) \
+                        + r * strikes[is_put] * np.exp(-r * T[is_put]) * norm.cdf(-d2[is_put])
+
+    # Convert to daily
+    if per_day:
+        theta = theta / 365.0
+
+    # Dealer (Short Premium) perspective
+    if dealer_perspective:
+        theta = -theta
+
+    return theta
+
+
 def vectorized_gamma_profile(
     spot: float,
     strikes: np.ndarray,

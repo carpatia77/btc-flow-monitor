@@ -1,14 +1,15 @@
 """
-GEX + VEX Analytics Engine — Computes Gamma and Vega Exposure from a MarketState snapshot.
+GEX + VEX + TEX Analytics Engine — Computes Gamma, Vega, and Theta Exposure.
 
 This module is designed to be called from a ProcessPoolExecutor (CPU-bound, GIL-free).
 It accepts a plain dict snapshot (serializable) and returns a plain dict result.
 
 Architecture note:
 - Deribit's `get_book_summary_by_currency` does NOT return Greeks.
-- We compute Gamma and Vega locally via vectorized Black-Scholes (black_scholes.py).
-- GEX Formula: Gamma * OI * Spot^2 * 0.01 * sign  (1 contract = 1 BTC on Deribit).
-- VEX Formula: Vega * OI * sign  (Vega already in USD per 1% IV move).
+- We compute Gamma, Vega, and Theta locally via vectorized Black-Scholes (black_scholes.py).
+- GEX Formula: Gamma * OI * Spot^2 * 0.01 * sign
+- VEX Formula: Vega * OI * sign
+- TEX Formula: Theta * OI  (from the Dealer's Short Premium perspective)
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from .black_scholes import vectorized_gamma, vectorized_vega, vectorized_gamma_profile
+from .black_scholes import vectorized_gamma, vectorized_vega, vectorized_theta, vectorized_gamma_profile
 
 
 def calculate_gex_from_snapshot(snapshot: dict) -> dict:
@@ -124,7 +125,27 @@ def calculate_gex_from_snapshot(snapshot: dict) -> dict:
     df["vega"] = vegas
     df["vex"] = vex_values
 
-    # ── 4. Aggregate by Strike ───────────────────────────────────────────
+    # ── 3c. TEX Calculation (Theta Exposure) ─────────────────────────────
+    # Theta from the Dealer (Short Premium) perspective.
+    # We fix r=0.0 as requested for crypto linear options simplification.
+    thetas = vectorized_theta(
+        spot=spot,
+        strikes=strikes,
+        T=T,
+        vol=vol,
+        contract_types=contract_types,
+        r=0.0,
+        q=0.0,
+        per_day=True,
+        dealer_perspective=True,
+    )
+
+    theta_exposure = thetas * oi
+
+    df["theta"] = thetas
+    df["theta_exposure"] = theta_exposure
+
+    # ── 4. Aggregate by Strike and Expiry ────────────────────────────────
     gex_by_strike = df.groupby("strike")["gex"].sum()
     call_mask = df["type"] == "C"
     put_mask = df["type"] == "P"
@@ -147,10 +168,22 @@ def calculate_gex_from_snapshot(snapshot: dict) -> dict:
     put_wall_strike = float(gex_by_strike.idxmin()) if not gex_by_strike.empty else 0.0
     put_wall_gex = float(gex_by_strike.min()) if not gex_by_strike.empty else 0.0
 
-    # ── 5b. VEX Totals ───────────────────────────────────────────────────
+    # ── 5b. VEX & TEX Totals and Metrics ─────────────────────────────────
     total_vex = float(vex_by_strike.sum())
     call_vex_total = float(df[call_mask]["vex"].sum())
     put_vex_total = float(df[put_mask]["vex"].sum())
+
+    # Theta by expiry
+    theta_by_expiry_series = df.groupby("expiration")["theta_exposure"].sum()
+    theta_by_expiry = {str(k): round(float(v), 2) for k, v in theta_by_expiry_series.items()}
+
+    # Max Pain / Pin Strike (Where Dealer makes the most Theta)
+    theta_by_strike = df.groupby("strike")["theta_exposure"].sum()
+    pin_strike = float(theta_by_strike.idxmax()) if not theta_by_strike.empty else 0.0
+    max_daily_income = float(theta_by_strike.max()) if not theta_by_strike.empty else 0.0
+
+    # Near-term TEX (<= 7 days)
+    near_term_tex = float(df[df["dte_days"] <= 7]["theta_exposure"].sum())
 
     # ── 6. Gamma Profile & Flip ──────────────────────────────────────────
     levels, profile_values = vectorized_gamma_profile(
@@ -192,6 +225,16 @@ def calculate_gex_from_snapshot(snapshot: dict) -> dict:
         "put_vex_usd": round(put_vex_total, 2),
         "vex_regime": vex_regime,
         "vex_gex_ratio": round(vex_gex_ratio, 3),
+
+        # TEX metrics
+        "tex_metrics": {
+            "total_tex_usd_per_day": round(float(theta_exposure.sum()), 2),
+            "theta_by_expiry": theta_by_expiry,
+            "dealer_pin_strike": pin_strike,
+            "dealer_max_daily_income_usd": round(max_daily_income, 2),
+            "near_term_tex_7d": round(near_term_tex, 2),
+            "perspective": "Dealer (Short Premium)"
+        },
 
         # Metadata
         "instruments_analyzed": len(df),
