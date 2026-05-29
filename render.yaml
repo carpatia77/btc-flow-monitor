@@ -32,9 +32,10 @@ services:
   # Portanto, subimos a imagem oficial do Timescale como um serviço privado.
   - type: pserv
     name: btc-timescaledb
-    env: docker
+    env: image
     region: ohio
-    image: timescale/timescaledb-ha:pg16
+    image:
+      url: docker.io/timescale/timescaledb-ha:pg16
     disk:
       name: timescaledb-data
       mountPath: /home/postgres/pgdata/data
