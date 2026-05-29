@@ -22,7 +22,7 @@ import pandas as pd
 from .black_scholes import vectorized_gamma, vectorized_vega, vectorized_theta, vectorized_gamma_profile
 
 
-def calculate_gex_from_snapshot(snapshot: dict) -> dict:
+def calculate_gex_from_snapshot(snapshot: dict, oi_diff_by_instrument: dict[str, float] | None = None) -> dict:
     """
     Main entry point: takes a state snapshot dict and returns a full GEX analysis.
 
@@ -45,49 +45,47 @@ def calculate_gex_from_snapshot(snapshot: dict) -> dict:
         raise ValueError("Options chain is empty — no instruments to analyze")
 
     # ── 1. Build DataFrame from chain dict ───────────────────────────────
-    records = []
-    now = datetime.now(timezone.utc)
 
-    for inst in chain.values():
-        # Parse expiration to compute days-to-expiry
-        try:
-            exp_date = datetime.strptime(inst.expiration, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        except (ValueError, AttributeError):
-            continue
+    df = pd.DataFrame([vars(inst) for inst in chain.values()])
+    df["dte_days"] = (pd.to_datetime(df["expiration"]).dt.tz_localize(None) - pd.Timestamp.utcnow().tz_localize(None)).dt.days
+    df["T"] = df["dte_days"] / 365.0
 
-        dte_days = (exp_date - now).days
-        if dte_days < 0:
-            continue  # Skip expired contracts
+    # Remove expired or exactly zero DTE to avoid math errors
+    df = df[df["T"] > 0]
 
-        if inst.open_interest <= 0:
-            continue  # No liquidity
-
-        if inst.mark_iv <= 0:
-            continue  # Cannot compute gamma without IV
-
-        records.append({
-            "instrument_name": inst.instrument_name,
-            "strike": inst.strike,
-            "expiration": inst.expiration,
-            "type": inst.option_type,  # "C" or "P"
-            "open_interest": inst.open_interest,
-            "mark_iv": inst.mark_iv,   # Already in decimal (e.g. 0.70)
-            "dte_days": dte_days,
-        })
-
-    if not records:
-        raise ValueError("No valid contracts with OI > 0 and future expiration")
-
-    df = pd.DataFrame(records)
-
-    # ── 2. Vectorized Black-Scholes Gamma ────────────────────────────────
     strikes = df["strike"].values
-    T = np.maximum(df["dte_days"].values / 365.0, 1e-6)
+    T = df["T"].values
     vol = df["mark_iv"].values
     oi = df["open_interest"].values
-    contract_types = np.where(df["type"].values == "C", 1.0, -1.0)
 
-    # Risk-free rate: use 5% default (could be parameterized or fetched)
+    # ── 1. Dynamic Dealer Positioning Estimation ─────────────────────────
+    # Naive assumption: Dealer is Long Call (+1.0) and Short Put (-1.0)
+    # Dynamic assumption: If OI increases, Retail is buying, Dealer is selling (Short).
+    # If OI decreases, Retail is closing, Dealer is buying (Long).
+    dealer_positions = []
+    for _, row in df.iterrows():
+        inst = row["instrument_name"]
+        is_call = (row["option_type"] == "C")
+        
+        # Base SqueezeMetrics naive assumption
+        pos = 1.0 if is_call else -1.0
+        
+        if oi_diff_by_instrument and inst in oi_diff_by_instrument:
+            oi_diff = oi_diff_by_instrument[inst]
+            if oi_diff > 0:
+                # Flow indicator: Open Interest increased
+                # Inference: Dealer provided liquidity (Sold to open). Dealer is Short.
+                pos = -0.8 if is_call else -1.2
+            elif oi_diff < 0:
+                # Flow indicator: Open Interest decreased
+                # Inference: Dealer bought back to close. Dealer is Long.
+                pos = 1.2 if is_call else 0.8
+                
+        dealer_positions.append(pos)
+        
+    contract_types = np.array(dealer_positions)
+
+    # ── 2. Greeks Calculation (Vectorized) ───────────────────────────────
     r = 0.05
 
     gammas = vectorized_gamma(
@@ -147,8 +145,8 @@ def calculate_gex_from_snapshot(snapshot: dict) -> dict:
 
     # ── 4. Aggregate by Strike and Expiry ────────────────────────────────
     gex_by_strike = df.groupby("strike")["gex"].sum()
-    call_mask = df["type"] == "C"
-    put_mask = df["type"] == "P"
+    call_mask = df["option_type"] == "C"
+    put_mask = df["option_type"] == "P"
     call_gex_by_strike = df[call_mask].groupby("strike")["gex"].sum()
     put_gex_by_strike = df[put_mask].groupby("strike")["gex"].sum()
 

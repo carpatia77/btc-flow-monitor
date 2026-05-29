@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  timescaledb:
+    image: timescale/timescaledb-ha:pg16
+    container_name: btc_flow_timescaledb
+    environment:
+      - POSTGRES_USER=deribit_user
+      - POSTGRES_PASSWORD=deribit_pass
+      - POSTGRES_DB=btc_options
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb_data:/home/postgres/pgdata/data
+    restart: unless-stopped
+    shm_size: 1g
+
+volumes:
+  timescaledb_data:
