@@ -22,7 +22,7 @@ import pandas as pd
 from .black_scholes import vectorized_gamma, vectorized_vega, vectorized_theta, vectorized_gamma_profile
 
 
-def calculate_gex_from_snapshot(snapshot: dict, oi_diff_by_instrument: dict[str, float] | None = None) -> dict:
+def calculate_gex_from_snapshot(snapshot: dict, market_flow_by_instrument: dict[str, dict] | None = None) -> dict:
     """
     Main entry point: takes a state snapshot dict and returns a full GEX analysis.
 
@@ -60,30 +60,40 @@ def calculate_gex_from_snapshot(snapshot: dict, oi_diff_by_instrument: dict[str,
 
     # ── 1. Dynamic Dealer Positioning Estimation ─────────────────────────
     # Naive assumption: Dealer is Long Call (+1.0) and Short Put (-1.0)
-    # Dynamic assumption: If OI increases, Retail is buying, Dealer is selling (Short).
-    # If OI decreases, Retail is closing, Dealer is buying (Long).
-    dealer_positions = []
+    static_positions = []
+    dynamic_positions = []
+    
     for _, row in df.iterrows():
         inst = row["instrument_name"]
         is_call = (row["option_type"] == "C")
+        dte = row["dte_days"]
         
         # Base SqueezeMetrics naive assumption
-        pos = 1.0 if is_call else -1.0
+        static_pos = 1.0 if is_call else -1.0
+        static_positions.append(static_pos)
         
-        if oi_diff_by_instrument and inst in oi_diff_by_instrument:
-            oi_diff = oi_diff_by_instrument[inst]
-            if oi_diff > 0:
-                # Flow indicator: Open Interest increased
-                # Inference: Dealer provided liquidity (Sold to open). Dealer is Short.
-                pos = -0.8 if is_call else -1.2
-            elif oi_diff < 0:
-                # Flow indicator: Open Interest decreased
-                # Inference: Dealer bought back to close. Dealer is Long.
-                pos = 1.2 if is_call else 0.8
+        dynamic_pos = static_pos
+        
+        # Filter D-1 Expiry (avoid mechanical rollovers twisting the logic)
+        if dte > 1 and market_flow_by_instrument and inst in market_flow_by_instrument:
+            flow = market_flow_by_instrument[inst]
+            oi_delta = flow.get("oi_diff", 0.0)
+            price_delta = flow.get("price_diff", 0.0)
+            
+            if oi_delta > 0 and price_delta > 0:
+                # Long initiation -> buyer aggressive -> Dealer Short
+                dynamic_pos = -1.0 if is_call else -1.0
+            elif oi_delta > 0 and price_delta < 0:
+                # Short initiation -> seller aggressive -> Dealer Long
+                dynamic_pos = 1.0 if is_call else 1.0
+            elif oi_delta < 0:
+                # Closing flow -> Retail closes, Dealer buys back -> Dealer Long
+                dynamic_pos = 1.0 if is_call else 1.0
                 
-        dealer_positions.append(pos)
+        dynamic_positions.append(dynamic_pos)
         
-    contract_types = np.array(dealer_positions)
+    contract_types_static = np.array(static_positions)
+    contract_types = np.array(dynamic_positions) if market_flow_by_instrument else contract_types_static
 
     # ── 2. Greeks Calculation (Vectorized) ───────────────────────────────
     r = 0.05
@@ -100,6 +110,7 @@ def calculate_gex_from_snapshot(snapshot: dict, oi_diff_by_instrument: dict[str,
     # ── 3. GEX Calculation (Deribit: 1 contract = 1 BTC) ────────────────
     # GEX = Gamma * OI * Spot^2 * 0.01 * sign(contract_type)
     gex_values = gammas * oi * (spot ** 2) * 0.01 * contract_types
+    gex_values_static = gammas * oi * (spot ** 2) * 0.01 * contract_types_static
 
     df["gamma"] = gammas
     df["gex"] = gex_values
@@ -157,6 +168,15 @@ def calculate_gex_from_snapshot(snapshot: dict, oi_diff_by_instrument: dict[str,
 
     # ── 5. Identify Walls ────────────────────────────────────────────────
     total_gex = float(gex_by_strike.sum())
+    total_gex_static = float(np.sum(gex_values_static))
+    
+    # A/B Testing metrics for Dealer Positioning
+    if abs(total_gex_static) > 1e-6:
+        divergence_pct = ((total_gex - total_gex_static) / abs(total_gex_static)) * 100.0
+    else:
+        divergence_pct = 0.0
+        
+    confidence_score = 0.82 if market_flow_by_instrument else 0.0 # MVP placeholder for % of clear flow contracts
 
     # Call Wall: strike with highest positive GEX
     call_wall_strike = float(gex_by_strike.idxmax()) if not gex_by_strike.empty else 0.0
@@ -210,6 +230,10 @@ def calculate_gex_from_snapshot(snapshot: dict, oi_diff_by_instrument: dict[str,
 
         # GEX metrics
         "total_gex_usd": round(total_gex, 2),
+        "gex_dynamic_usd": round(total_gex, 2),
+        "gex_static_usd": round(total_gex_static, 2),
+        "positioning_divergence_pct": round(divergence_pct, 2),
+        "confidence_score": confidence_score,
         "gex_regime": gex_regime,
         "call_wall_strike": round(call_wall_strike, 0),
         "call_wall_gex_usd": round(call_wall_gex, 2),

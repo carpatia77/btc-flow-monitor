@@ -50,6 +50,7 @@ async def init_db(pool: asyncpg.Pool) -> None:
                 option_type VARCHAR(1) NOT NULL,
                 expiration DATE NOT NULL,
                 spot_price NUMERIC NOT NULL,
+                mark_price NUMERIC NOT NULL,
                 open_interest NUMERIC NOT NULL,
                 mark_iv NUMERIC NOT NULL,
                 volume NUMERIC NOT NULL
@@ -67,6 +68,14 @@ async def init_db(pool: asyncpg.Pool) -> None:
             await conn.execute("SELECT create_hypertable('options_history', 'time');")
             # Index for fast OI lookup by instrument
             await conn.execute("CREATE INDEX ix_options_history_instrument_time ON options_history (instrument_name, time DESC);")
+            
+            # Compression and Retention Policies
+            try:
+                await conn.execute("ALTER TABLE options_history SET (timescaledb.compress, timescaledb.compress_segmentby = 'instrument_name');")
+                await conn.execute("SELECT add_compression_policy('options_history', compress_after => INTERVAL '7 days');")
+                await conn.execute("SELECT add_retention_policy('options_history', drop_after => INTERVAL '90 days');")
+            except Exception as e:
+                logger.warning(f"Could not apply compression/retention to options_history (requires TimescaleDB advanced features): {e}")
 
         # Analytics Snapshots Table
         await conn.execute("""
@@ -90,6 +99,10 @@ async def init_db(pool: asyncpg.Pool) -> None:
         if hyper_check_analytics == 0:
             logger.info("Converting analytics_snapshots to hypertable...")
             await conn.execute("SELECT create_hypertable('analytics_snapshots', 'time');")
+            try:
+                await conn.execute("SELECT add_retention_policy('analytics_snapshots', drop_after => INTERVAL '2 years');")
+            except Exception as e:
+                logger.warning(f"Could not apply retention to analytics_snapshots: {e}")
 
         logger.info("TimescaleDB initialized successfully.")
 
@@ -105,6 +118,7 @@ async def save_options_chain(pool: asyncpg.Pool, instruments: list[Any], spot_pr
             inst.option_type,
             inst.expiration, # Date string 'YYYY-MM-DD'
             spot_price,
+            inst.mark_price,
             inst.open_interest,
             inst.mark_iv,
             inst.volume
@@ -113,8 +127,8 @@ async def save_options_chain(pool: asyncpg.Pool, instruments: list[Any], spot_pr
     query = """
         INSERT INTO options_history (
             time, instrument_name, strike, option_type, expiration, 
-            spot_price, open_interest, mark_iv, volume
-        ) VALUES ($1, $2, $3, $4, $5::date, $6, $7, $8, $9)
+            spot_price, mark_price, open_interest, mark_iv, volume
+        ) VALUES ($1, $2, $3, $4, $5::date, $6, $7, $8, $9, $10)
     """
     async with pool.acquire() as conn:
         await conn.executemany(query, records)
@@ -143,13 +157,13 @@ async def save_analytics_snapshot(pool: asyncpg.Pool, payload: dict, timestamp: 
         )
 
 
-async def get_latest_oi_snapshot(pool: asyncpg.Pool) -> dict[str, float]:
+async def get_latest_market_data_snapshot(pool: asyncpg.Pool) -> dict[str, dict]:
     """
-    Returns the most recent Open Interest for each instrument recorded in the last 15 minutes.
-    Used to calculate OI difference (flow) for Dealer Positioning.
+    Returns the most recent Open Interest and Mark Price for each instrument recorded in the last 15 minutes.
+    Used to calculate OI difference and Price difference for Dealer Positioning.
     """
     query = """
-        SELECT DISTINCT ON (instrument_name) instrument_name, open_interest
+        SELECT DISTINCT ON (instrument_name) instrument_name, open_interest, mark_price
         FROM options_history
         WHERE time > NOW() - INTERVAL '15 minutes'
         ORDER BY instrument_name, time DESC;
@@ -157,4 +171,9 @@ async def get_latest_oi_snapshot(pool: asyncpg.Pool) -> dict[str, float]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(query)
     
-    return {row["instrument_name"]: float(row["open_interest"]) for row in rows}
+    return {
+        row["instrument_name"]: {
+            "open_interest": float(row["open_interest"]),
+            "mark_price": float(row["mark_price"])
+        } for row in rows
+    }

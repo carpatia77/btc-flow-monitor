@@ -32,7 +32,7 @@ async def run() -> dict:
     from src.engine.gex_analytics import calculate_gex_from_snapshot
     from src.database.timescale import (
         get_db_pool, init_db, save_options_chain, 
-        save_analytics_snapshot, get_latest_oi_snapshot
+        save_analytics_snapshot, get_latest_market_data_snapshot
     )
 
     start = time.perf_counter()
@@ -46,26 +46,30 @@ async def run() -> dict:
     snapshot = state.get_snapshot()
 
     # 3. Database Operations (Historical OI and Persistence)
-    oi_diff_by_instrument = {}
+    market_flow_by_instrument = {}
     db_pool = None
     try:
         db_pool = await get_db_pool()
         await init_db(db_pool)
         
         # Get past OI to compute flow (Dealer Positioning Estimation)
-        past_oi = await get_latest_oi_snapshot(db_pool)
+        past_data = await get_latest_market_data_snapshot(db_pool)
         
         # Calculate diffs
         for inst in instruments:
-            if inst.instrument_name in past_oi:
-                oi_diff_by_instrument[inst.instrument_name] = inst.open_interest - past_oi[inst.instrument_name]
+            if inst.instrument_name in past_data:
+                past = past_data[inst.instrument_name]
+                market_flow_by_instrument[inst.instrument_name] = {
+                    "oi_diff": inst.open_interest - past["open_interest"],
+                    "price_diff": inst.mark_price - past["mark_price"]
+                }
                 
     except Exception as e:
         # Graceful fallback: If DB is down, we still calculate GEX but without dynamic positioning
         print(f"DB Error (Fallback to static positioning): {e}", file=sys.stderr)
 
-    # 4. Calculate GEX (with dynamic positioning if DB provided oi_diff)
-    result = calculate_gex_from_snapshot(snapshot, oi_diff_by_instrument=oi_diff_by_instrument)
+    # 4. Calculate GEX (with dynamic positioning if DB provided flow)
+    result = calculate_gex_from_snapshot(snapshot, market_flow_by_instrument=market_flow_by_instrument)
 
     # 5. Save Analytics Snapshot
     if db_pool and result.get("status", "ok") == "ok":
@@ -85,7 +89,7 @@ async def run() -> dict:
     result["status"] = "ok"
     
     # Include metadata about dealer positioning
-    result["dealer_positioning"] = "dynamic" if oi_diff_by_instrument else "static (fallback)"
+    result["dealer_positioning"] = "dynamic" if market_flow_by_instrument else "static (fallback)"
 
     return result
 
